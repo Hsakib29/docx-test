@@ -8,6 +8,7 @@ const XMLNS = "http://www.w3.org/XML/1998/namespace";
 const LANGS = { en: "English", bn: "Bengali", hi: "Hindi", ur: "Urdu", ar: "Arabic", es: "Spanish", fr: "French", de: "German" };
 const BN_DIGITS = "০১২৩৪৫৬৭৮৯";
 const toBn = (s) => s.replace(/[0-9]/g, (d) => BN_DIGITS[d]);
+const reviewed = (x) => x.status === "edited" || x.ok;
 const STATUS = { tm: "From memory", mt: "Machine", error: "Failed", kept: "Already translated", edited: "Edited" };
 
 /* ---------- DOCX helpers ---------- */
@@ -116,17 +117,18 @@ async function translateText(text, sl, tl) {
   return lines.join("\n");
 }
 
-async function processFile(file, { sl, tl, localize }, mem, onTick) {
+async function processFile(file, { sl, tl, localize, mtpe }, mem, onTick) {
   const { zip, dom, rows } = await loadDocx(file);
   const todo = rows.filter((r) => r.src && !r.tgt);
   const fromMemory = new Set(todo.filter((r) => Object.hasOwn(mem, r.src)).map((r) => r.src));
   const need = [...new Set(todo.map((r) => r.src).filter((s) => !fromMemory.has(s)))];
   const failed = new Set();
+  const fresh = {};
   let next = 0, done = 0;
   const worker = async () => {
     while (next < need.length) {
       const s = need[next++];
-      try { mem[s] = await translateText(s, sl, tl); } catch { failed.add(s); }
+      try { (mtpe ? fresh : mem)[s] = await translateText(s, sl, tl); } catch { failed.add(s); }
       onTick(++done, need.length);
     }
   };
@@ -135,11 +137,11 @@ async function processFile(file, { sl, tl, localize }, mem, onTick) {
   const segs = [];
   for (const r of rows) {
     if (!r.src) continue;
-    if (r.tgt) { segs.push({ src: r.src, tgt: r.tgt, status: "kept", row: r }); continue; }
-    let out = failed.has(r.src) ? "[Translation Error]" : mem[r.src];
+    if (r.tgt) { segs.push({ src: r.src, tgt: r.tgt, status: "kept", ok: false, row: r }); continue; }
+    let out = failed.has(r.src) ? "[Translation Error]" : Object.hasOwn(mem, r.src) ? mem[r.src] : fresh[r.src];
     if (localize && tl === "bn") out = toBn(out);
     writeCell(dom, r, out);
-    segs.push({ src: r.src, tgt: out, status: failed.has(r.src) ? "error" : fromMemory.has(r.src) ? "tm" : "mt", row: r });
+    segs.push({ src: r.src, tgt: out, status: failed.has(r.src) ? "error" : fromMemory.has(r.src) ? "tm" : "mt", ok: false, row: r });
   }
   return { zip, dom, segs };
 }
@@ -190,22 +192,34 @@ function countStats(segs) {
   return st;
 }
 
-function Seg({ seg, lang, onCommit, onRetry }) {
+function Seg({ seg, lang, mtpe, onCommit, onConfirm, onRetry }) {
   const [v, setV] = useState(seg.tgt);
   useEffect(() => setV(seg.tgt), [seg.tgt]);
+  const done = reviewed(seg);
+  const canConfirm = mtpe && !done && seg.status !== "error";
+  const onKey = (e) => {
+    if (!((e.ctrlKey || e.metaKey) && e.key === "Enter")) return;
+    e.preventDefault();
+    if (v !== seg.tgt) onCommit(v); else if (canConfirm) onConfirm();
+    let n = e.currentTarget.closest("tr").nextElementSibling;
+    while (n && n.dataset.pending !== "true") n = n.nextElementSibling;
+    n?.querySelector("textarea").focus();
+  };
   return (
-    <tr>
+    <tr data-pending={mtpe && !done ? "true" : "false"}>
       <td>{seg.src}</td>
       <td>
         <textarea
           lang={lang} value={v} aria-label={"Translation of: " + seg.src.slice(0, 60)}
           rows={Math.max(2, v.split("\n").length, Math.ceil(v.length / 45))}
-          onChange={(e) => setV(e.target.value)}
+          onChange={(e) => setV(e.target.value)} onKeyDown={onKey}
           onBlur={() => { if (v !== seg.tgt) onCommit(v); }}
         />
       </td>
       <td>
         <span className={"dt-tag dt-" + seg.status}>{STATUS[seg.status]}</span>
+        {seg.ok && seg.status !== "edited" && <span className="dt-tag dt-ok">Confirmed</span>}
+        {canConfirm && <button className="dt-mini" onClick={onConfirm}>Confirm</button>}
         {seg.status !== "kept" && <button className="dt-mini" onClick={onRetry}>Retranslate</button>}
       </td>
     </tr>
@@ -221,6 +235,9 @@ export default function DocxTranslator() {
   const [results, setResults] = useState([]);
   const [open, setOpen] = useState(null);
   const [filter, setFilter] = useState("all");
+  const [mtpe, setMtpe] = useState(false);
+  const resultsRef = useRef([]);
+  const update = (fn) => { const next = fn(resultsRef.current); resultsRef.current = next; setResults(next); };
   const [limit, setLimit] = useState(100);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(null);
@@ -241,7 +258,7 @@ export default function DocxTranslator() {
   };
 
   const run = async () => {
-    setBusy(true); setNote(""); setResults([]); setOpen(null);
+    setBusy(true); setNote(""); update(() => []); setOpen(null);
     if (samples.length) {
       const n = await addSamples(samples, mem.current);
       setNote(`Added ${n} segment${n === 1 ? "" : "s"} from samples to memory.`);
@@ -251,40 +268,48 @@ export default function DocxTranslator() {
     for (const f of queue) {
       setProgress({ file: f.name, done: 0, total: 0 });
       try {
-        const r = await processFile(f, { sl, tl, localize }, mem.current, (done, total) => setProgress({ file: f.name, done, total }));
+        const r = await processFile(f, { sl, tl, localize, mtpe }, mem.current, (done, total) => setProgress({ file: f.name, done, total }));
         out.push({ name: f.name.replace(/\.docx$/i, "") + "_translated.docx", ...r });
       } catch (e) {
         out.push({ name: f.name, error: e.message });
       }
-      setResults([...out]);
+      update(() => [...out]);
     }
-    persist(); setProgress(null); setQueue([]); setBusy(false);
+    persist(); setProgress(null); setQueue([]); setBusy(false); setFilter("all"); setOpen(mtpe && out.length ? 0 : null);
   };
 
-  // Saves an edit into the DOCX, the memory, and any identical untouched segments in the same file.
+  // Saves an edit into the DOCX and memory. Identical untouched segments get the same text
+  // (already reviewed outside MTPE mode; still awaiting confirmation inside it).
   const commit = (ri, si, text, status = "edited") => {
-    const r = results[ri];
+    const r = resultsRef.current[ri];
     const src = r.segs[si].src;
     const segs = r.segs.map((x, j) => {
-      const same = j === si || (x.src === src && ["mt", "tm", "error"].includes(x.status));
-      if (!same) return x;
+      if (j !== si && !(x.src === src && ["mt", "tm", "error"].includes(x.status))) return x;
       writeCell(r.dom, x.row, text);
-      return { ...x, tgt: text, status };
+      if (j === si) return { ...x, tgt: text, status, ok: status === "edited" };
+      return mtpe ? { ...x, tgt: text, status: x.status === "error" ? "mt" : x.status, ok: false } : { ...x, tgt: text, status };
     });
-    setResults(results.map((x, i) => (i === ri ? { ...r, segs } : x)));
-    mem.current[src] = text;
-    persist();
+    update((all) => all.map((x, i) => (i === ri ? { ...r, segs } : x)));
+    if (!mtpe || status === "edited") { mem.current[src] = text; persist(); }
+  };
+
+  const confirm = (ri, si) => {
+    const r = resultsRef.current[ri];
+    const t = r.segs[si];
+    const segs = r.segs.map((x, j) => (j === si || (x.src === t.src && x.tgt === t.tgt) ? { ...x, ok: true } : x));
+    update((all) => all.map((x, i) => (i === ri ? { ...r, segs } : x)));
+    mem.current[t.src] = t.tgt; persist();
   };
 
   const retry = async (ri, si) => {
     try {
-      let t = await translateText(results[ri].segs[si].src, sl, tl);
+      let t = await translateText(resultsRef.current[ri].segs[si].src, sl, tl);
       if (localize && tl === "bn") t = toBn(t);
       commit(ri, si, t, "mt");
     } catch { setNote("Retranslate failed. Check your connection and try again."); }
   };
 
-  const match = (x) => filter === "all" || (filter === "review" ? x.status === "mt" || x.status === "error" : x.status === "edited");
+  const match = (x) => filter === "all" || (filter === "review" ? (mtpe ? !reviewed(x) : x.status === "mt" || x.status === "error") : x.status === "edited");
 
   const exportMem = () => download(new Blob([JSON.stringify(mem.current, null, 2)], { type: "application/json" }), "translation_memory.json");
   const importMem = async (file) => {
@@ -316,6 +341,7 @@ export default function DocxTranslator() {
         {tl === "bn" && (
           <label className="dt-check"><input type="checkbox" checked={localize} onChange={(e) => setLocalize(e.target.checked)} /> Use Bengali digits (০–৯)</label>
         )}
+        <label className="dt-check"><input type="checkbox" checked={mtpe} onChange={(e) => setMtpe(e.target.checked)} disabled={busy} /> MTPE mode: review every segment before download</label>
       </div>
 
       <div className="dt-grid">
@@ -347,6 +373,7 @@ export default function DocxTranslator() {
           <div key={i} className="dt-result"><div className="dt-head"><div><strong>{r.name}</strong><span className="dt-err">{r.error}</span></div></div></div>
         );
         const st = countStats(r.segs);
+        const pending = r.segs.filter((x) => !reviewed(x)).length;
         const vis = r.segs.map((x, j) => [x, j]).filter(([x]) => match(x));
         return (
           <div key={i} className="dt-result">
@@ -357,7 +384,7 @@ export default function DocxTranslator() {
               </div>
               <div className="dt-actions">
                 <button onClick={() => { setOpen(open === i ? null : i); setLimit(100); }}>{open === i ? "Close editor" : "Review and edit"}</button>
-                <button className="dt-primary" onClick={async () => download(await saveDocx(r.zip, r.dom), r.name)}>Download</button>
+                <button className="dt-primary" disabled={mtpe && pending > 0} onClick={async () => download(await saveDocx(r.zip, r.dom), r.name)}>{mtpe && pending > 0 ? `${pending} left to review` : "Download"}</button>
               </div>
             </div>
             {open === i && (
@@ -366,14 +393,14 @@ export default function DocxTranslator() {
                   {[["all", "All"], ["review", "Needs review"], ["edited", "Edited"]].map(([k, l]) => (
                     <button key={k} className={filter === k ? "is-on" : ""} aria-pressed={filter === k} onClick={() => { setFilter(k); setLimit(100); }}>{l}</button>
                   ))}
-                  <span>Edits save when you click out of a box.</span>
+                  <span>{mtpe ? `${r.segs.length - pending} of ${r.segs.length} reviewed · Ctrl+Enter confirms and moves on` : "Edits save when you click out of a box."}</span>
                 </div>
                 <div className="dt-scroll">
                   <table>
                     <thead><tr><th>Source</th><th>Translation</th><th>Origin</th></tr></thead>
                     <tbody>
                       {vis.slice(0, limit).map(([x, j]) => (
-                        <Seg key={j} seg={x} lang={tl} onCommit={(t) => commit(i, j, t)} onRetry={() => retry(i, j)} />
+                        <Seg key={j} seg={x} lang={tl} mtpe={mtpe} onCommit={(t) => commit(i, j, t)} onConfirm={() => confirm(i, j)} onRetry={() => retry(i, j)} />
                       ))}
                     </tbody>
                   </table>
@@ -428,6 +455,8 @@ const CSS = `
 .dt-tag{font-size:.78rem;padding:2px 8px;border-radius:99px;border:1px solid var(--line);white-space:nowrap}
 .dt-tag.dt-tm{border-color:var(--acc);color:var(--acc)}
 .dt-tag.dt-error{border-color:var(--bad);color:var(--bad)}
+.dt-tag.dt-ok{border-color:var(--acc);color:var(--acc);margin-left:4px}
+.dt-scroll tr[data-pending="true"] td:first-child{box-shadow:inset 3px 0 0 var(--acc)}
 .dt-tag.dt-edited{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
 .dt-filter{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 16px;border-top:1px solid var(--line)}
 .dt-filter span{margin-left:auto;font-size:.82rem;color:var(--mute)}
