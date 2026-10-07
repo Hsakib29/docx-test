@@ -57,7 +57,7 @@ function writeCell(dom, row, text) {
   if (srcRpr) {
     const rpr = dom.createElementNS(W, "w:rPr");
     for (const c of srcRpr.children)
-      if (["b", "bCs", "i", "iCs", "u", "sz", "szCs"].includes(c.localName)) rpr.appendChild(c.cloneNode(true));
+      if (["b", "bCs", "i", "iCs", "u", "sz", "szCs", "color", "highlight"].includes(c.localName)) rpr.appendChild(c.cloneNode(true));
     if (rpr.childNodes.length) r.appendChild(rpr);
   }
   text.split("\n").forEach((line, i) => {
