@@ -1,4 +1,4 @@
-// DocxTranslator.jsx — browser port of translate_snake V1
+// DocxTranslator.jsx — browser port of translate_snake V1, with a segment post-editor
 // Setup:  npm i jszip   →   import DocxTranslator from "./DocxTranslator";  <DocxTranslator />
 import { useState, useRef, useEffect } from "react";
 import JSZip from "jszip";
@@ -8,7 +8,7 @@ const XMLNS = "http://www.w3.org/XML/1998/namespace";
 const LANGS = { en: "English", bn: "Bengali", hi: "Hindi", ur: "Urdu", ar: "Arabic", es: "Spanish", fr: "French", de: "German" };
 const BN_DIGITS = "০১২৩৪৫৬৭৮৯";
 const toBn = (s) => s.replace(/[0-9]/g, (d) => BN_DIGITS[d]);
-const STATUS = { tm: "From memory", mt: "Machine", error: "Failed", kept: "Already translated" };
+const STATUS = { tm: "From memory", mt: "Machine", error: "Failed", kept: "Already translated", edited: "Edited" };
 
 /* ---------- DOCX helpers ---------- */
 const kids = (el, name) => [...el.children].filter((c) => c.namespaceURI === W && c.localName === name);
@@ -132,18 +132,16 @@ async function processFile(file, { sl, tl, localize }, mem, onTick) {
   };
   await Promise.all(Array.from({ length: Math.min(4, need.length) }, worker));
 
-  const preview = [];
+  const segs = [];
   for (const r of rows) {
     if (!r.src) continue;
-    if (r.tgt) { preview.push({ src: r.src, tgt: r.tgt, status: "kept" }); continue; }
+    if (r.tgt) { segs.push({ src: r.src, tgt: r.tgt, status: "kept", row: r }); continue; }
     let out = failed.has(r.src) ? "[Translation Error]" : mem[r.src];
     if (localize && tl === "bn") out = toBn(out);
     writeCell(dom, r, out);
-    preview.push({ src: r.src, tgt: out, status: failed.has(r.src) ? "error" : fromMemory.has(r.src) ? "tm" : "mt" });
+    segs.push({ src: r.src, tgt: out, status: failed.has(r.src) ? "error" : fromMemory.has(r.src) ? "tm" : "mt", row: r });
   }
-  const stats = { tm: 0, mt: 0, error: 0, kept: 0 };
-  preview.forEach((p) => stats[p.status]++);
-  return { blob: await saveDocx(zip, dom), preview, stats };
+  return { zip, dom, segs };
 }
 
 async function addSamples(files, mem) {
@@ -186,6 +184,34 @@ function Drop({ title, hint, files, onFiles }) {
   );
 }
 
+function countStats(segs) {
+  const st = { tm: 0, mt: 0, error: 0, kept: 0, edited: 0 };
+  segs.forEach((x) => st[x.status]++);
+  return st;
+}
+
+function Seg({ seg, lang, onCommit, onRetry }) {
+  const [v, setV] = useState(seg.tgt);
+  useEffect(() => setV(seg.tgt), [seg.tgt]);
+  return (
+    <tr>
+      <td>{seg.src}</td>
+      <td>
+        <textarea
+          lang={lang} value={v} aria-label={"Translation of: " + seg.src.slice(0, 60)}
+          rows={Math.max(2, v.split("\n").length, Math.ceil(v.length / 45))}
+          onChange={(e) => setV(e.target.value)}
+          onBlur={() => { if (v !== seg.tgt) onCommit(v); }}
+        />
+      </td>
+      <td>
+        <span className={"dt-tag dt-" + seg.status}>{STATUS[seg.status]}</span>
+        {seg.status !== "kept" && <button className="dt-mini" onClick={onRetry}>Retranslate</button>}
+      </td>
+    </tr>
+  );
+}
+
 export default function DocxTranslator() {
   const [sl, setSl] = useState("en");
   const [tl, setTl] = useState("bn");
@@ -194,6 +220,8 @@ export default function DocxTranslator() {
   const [samples, setSamples] = useState([]);
   const [results, setResults] = useState([]);
   const [open, setOpen] = useState(null);
+  const [filter, setFilter] = useState("all");
+  const [limit, setLimit] = useState(100);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(null);
   const [note, setNote] = useState("");
@@ -232,6 +260,31 @@ export default function DocxTranslator() {
     }
     persist(); setProgress(null); setQueue([]); setBusy(false);
   };
+
+  // Saves an edit into the DOCX, the memory, and any identical untouched segments in the same file.
+  const commit = (ri, si, text, status = "edited") => {
+    const r = results[ri];
+    const src = r.segs[si].src;
+    const segs = r.segs.map((x, j) => {
+      const same = j === si || (x.src === src && ["mt", "tm", "error"].includes(x.status));
+      if (!same) return x;
+      writeCell(r.dom, x.row, text);
+      return { ...x, tgt: text, status };
+    });
+    setResults(results.map((x, i) => (i === ri ? { ...r, segs } : x)));
+    mem.current[src] = text;
+    persist();
+  };
+
+  const retry = async (ri, si) => {
+    try {
+      let t = await translateText(results[ri].segs[si].src, sl, tl);
+      if (localize && tl === "bn") t = toBn(t);
+      commit(ri, si, t, "mt");
+    } catch { setNote("Retranslate failed. Check your connection and try again."); }
+  };
+
+  const match = (x) => filter === "all" || (filter === "review" ? x.status === "mt" || x.status === "error" : x.status === "edited");
 
   const exportMem = () => download(new Blob([JSON.stringify(mem.current, null, 2)], { type: "application/json" }), "translation_memory.json");
   const importMem = async (file) => {
@@ -289,37 +342,49 @@ export default function DocxTranslator() {
       )}
       {note && <p className="dt-note" role="status">{note}</p>}
 
-      {results.map((r, i) => (
-        <div key={i} className="dt-result">
-          <div className="dt-head">
-            <div>
-              <strong>{r.name}</strong>
-              {r.error ? <span className="dt-err">{r.error}</span> : (
-                <span>{r.stats.mt} machine · {r.stats.tm} from memory · {r.stats.kept} already translated{r.stats.error ? ` · ${r.stats.error} failed` : ""}</span>
-              )}
-            </div>
-            {!r.error && (
-              <div className="dt-actions">
-                <button onClick={() => setOpen(open === i ? null : i)}>{open === i ? "Hide preview" : "Preview"}</button>
-                <button className="dt-primary" onClick={() => download(r.blob, r.name)}>Download</button>
+      {results.map((r, i) => {
+        if (r.error) return (
+          <div key={i} className="dt-result"><div className="dt-head"><div><strong>{r.name}</strong><span className="dt-err">{r.error}</span></div></div></div>
+        );
+        const st = countStats(r.segs);
+        const vis = r.segs.map((x, j) => [x, j]).filter(([x]) => match(x));
+        return (
+          <div key={i} className="dt-result">
+            <div className="dt-head">
+              <div>
+                <strong>{r.name}</strong>
+                <span>{st.mt} machine · {st.tm} from memory · {st.edited} edited · {st.kept} already translated{st.error ? ` · ${st.error} failed` : ""}</span>
               </div>
+              <div className="dt-actions">
+                <button onClick={() => { setOpen(open === i ? null : i); setLimit(100); }}>{open === i ? "Close editor" : "Review and edit"}</button>
+                <button className="dt-primary" onClick={async () => download(await saveDocx(r.zip, r.dom), r.name)}>Download</button>
+              </div>
+            </div>
+            {open === i && (
+              <>
+                <div className="dt-filter" role="group" aria-label="Filter segments">
+                  {[["all", "All"], ["review", "Needs review"], ["edited", "Edited"]].map(([k, l]) => (
+                    <button key={k} className={filter === k ? "is-on" : ""} aria-pressed={filter === k} onClick={() => { setFilter(k); setLimit(100); }}>{l}</button>
+                  ))}
+                  <span>Edits save when you click out of a box.</span>
+                </div>
+                <div className="dt-scroll">
+                  <table>
+                    <thead><tr><th>Source</th><th>Translation</th><th>Origin</th></tr></thead>
+                    <tbody>
+                      {vis.slice(0, limit).map(([x, j]) => (
+                        <Seg key={j} seg={x} lang={tl} onCommit={(t) => commit(i, j, t)} onRetry={() => retry(i, j)} />
+                      ))}
+                    </tbody>
+                  </table>
+                  {vis.length === 0 && <p className="dt-note" style={{ padding: "0 12px" }}>No segments match this filter.</p>}
+                  {vis.length > limit && <div style={{ padding: 12 }}><button onClick={() => setLimit(limit + 100)}>Show more ({vis.length - limit} left)</button></div>}
+                </div>
+              </>
             )}
           </div>
-          {open === i && (
-            <div className="dt-scroll">
-              <table>
-                <thead><tr><th>Source</th><th>Translation</th><th>Origin</th></tr></thead>
-                <tbody>
-                  {r.preview.slice(0, 300).map((p, j) => (
-                    <tr key={j}><td>{p.src}</td><td lang={tl}>{p.tgt}</td><td><span className={"dt-tag dt-" + p.status}>{STATUS[p.status]}</span></td></tr>
-                  ))}
-                </tbody>
-              </table>
-              {r.preview.length > 300 && <p className="dt-note">Showing the first 300 of {r.preview.length} rows. The download contains all of them.</p>}
-            </div>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </section>
   );
 }
@@ -363,4 +428,11 @@ const CSS = `
 .dt-tag{font-size:.78rem;padding:2px 8px;border-radius:99px;border:1px solid var(--line);white-space:nowrap}
 .dt-tag.dt-tm{border-color:var(--acc);color:var(--acc)}
 .dt-tag.dt-error{border-color:var(--bad);color:var(--bad)}
+.dt-tag.dt-edited{background:var(--acc);border-color:var(--acc);color:var(--acc-ink)}
+.dt-filter{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 16px;border-top:1px solid var(--line)}
+.dt-filter span{margin-left:auto;font-size:.82rem;color:var(--mute)}
+.dt .dt-filter .is-on{background:var(--ink);color:var(--card);border-color:var(--ink)}
+.dt-scroll textarea{width:100%;min-width:240px;font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:6px 8px;resize:vertical}
+.dt-scroll textarea:focus{background:var(--card);border-color:var(--acc)}
+.dt .dt-mini{display:block;margin-top:6px;padding:3px 8px;font-size:.78rem}
 `;
